@@ -263,7 +263,7 @@ CC=/path/to/musl-gcc go build --ldflags '-linkmode external -extldflags "-static
 FIPS 140-3 Compliance
 =====================
 
-This client supports FIPS 140-3 compliance for Schema Registry operations when using Go 1.24.3 or newer.
+This client supports FIPS 140-3 compliance for Schema Registry operations using Go's native FIPS support.
 
 ## Communication between client and Schema Registry
 
