@@ -51,6 +51,18 @@ type Consumer struct {
 
 	isClosed  uint32
 	isClosing uint32
+
+	// closeSkipOnFatal, when true, causes Close() to skip the consumer group
+	// close protocol (LeaveGroup, offset commits) if the consumer has a fatal
+	// error set (e.g., FENCED_INSTANCE_ID). Instead, it force-destroys the
+	// handle immediately using rd_kafka_destroy_flags(NO_CONSUMER_CLOSE).
+	//
+	// This prevents Close() from hanging indefinitely when the consumer is
+	// already dead and the broker is slow to respond to commits that will be
+	// rejected anyway.
+	//
+	// Configured via "go.consumer.close.skip.on.fatal" (bool, default false).
+	closeSkipOnFatal bool
 }
 
 // IsClosed returns boolean representing if client is closed or not
@@ -528,6 +540,11 @@ func (c *Consumer) ReadMessage(timeout time.Duration) (*Message, error) {
 
 // Close Consumer instance.
 // The object is no longer usable after this call.
+//
+// If go.consumer.close.skip.on.fatal is enabled and the consumer has a fatal
+// error (e.g., FENCED_INSTANCE_ID), Close() will skip the consumer group close
+// protocol entirely and force-destroy the handle. This prevents hanging on
+// offset commits that will be rejected by the broker anyway.
 func (c *Consumer) Close() (err error) {
 	// Check if the client is already closed.
 	err = c.verifyClient()
@@ -545,6 +562,24 @@ func (c *Consumer) Close() (err error) {
 	c.handle.waitGroup.Wait()
 	if c.eventsChanEnable {
 		close(c.events)
+	}
+
+	// If the consumer has a fatal error and skip-on-fatal is enabled,
+	// bypass the close protocol entirely. The consumer is already dead
+	// from the broker's perspective — attempting commits or LeaveGroup
+	// will either be rejected or hang if the broker is unresponsive.
+	if c.closeSkipOnFatal {
+		cErrstr := (*C.char)(C.malloc(C.size_t(512)))
+		fatalCode := C.rd_kafka_fatal_error(c.handle.rk, cErrstr, 512)
+		C.free(unsafe.Pointer(cErrstr))
+		if int(fatalCode) != 0 {
+			atomic.StoreUint32(&c.isClosed, 1)
+			C.rd_kafka_queue_destroy(c.handle.rkq)
+			c.handle.rkq = nil
+			c.handle.cleanup()
+			C.rd_kafka_destroy_flags(c.handle.rk, C.RD_KAFKA_DESTROY_F_NO_CONSUMER_CLOSE)
+			return nil
+		}
 	}
 
 	C.rd_kafka_consumer_close_queue(c.handle.rk, c.handle.rkq)
@@ -581,6 +616,11 @@ func (c *Consumer) Close() (err error) {
 //	go.events.channel.size (int, 1000) - Events() channel size
 //	go.logs.channel.enable (bool, false) - Forward log to Logs() channel.
 //	go.logs.channel (chan kafka.LogEvent, nil) - Forward logs to application-provided channel instead of Logs(). Requires go.logs.channel.enable=true.
+//	go.consumer.close.skip.on.fatal (bool, false) - If true, Close() will skip the consumer group close protocol
+//	                                     (LeaveGroup, offset commits) when the consumer has a fatal error
+//	                                     (e.g., fenced by another instance). Instead it force-destroys the
+//	                                     handle immediately, preventing Close() from hanging on commits
+//	                                     that will be rejected by the broker.
 //
 // WARNING: Due to the buffering nature of channels (and queues in general) the
 // use of the events channel risks receiving outdated events and
@@ -627,6 +667,12 @@ func NewConsumer(conf *ConfigMap) (*Consumer, error) {
 		return nil, err
 	}
 	eventsChanSize := v.(int)
+
+	v, err = confCopy.extract("go.consumer.close.skip.on.fatal", false)
+	if err != nil {
+		return nil, err
+	}
+	c.closeSkipOnFatal = v.(bool)
 
 	logsChanEnable, logsChan, err := confCopy.extractLogConfig()
 	if err != nil {
