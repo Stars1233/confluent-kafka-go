@@ -769,6 +769,56 @@ func testConsumerWaitAssignment(c *Consumer, t *testing.T) {
 	}
 }
 
+// TestConsumerCloseHangsOnFatalWithoutSkip demonstrates that Close() hangs
+// when a consumer has a fatal error and go.consumer.close.skip.on.fatal is
+// NOT enabled. This reproduces the production bug: a fenced consumer's Close()
+// enters an infinite polling loop because the revocation offset commit cannot
+// complete.
+func TestConsumerCloseHangsOnFatalWithoutSkip(t *testing.T) {
+	c, err := NewConsumer(&ConfigMap{
+		"group.id":           "test-close-hangs-on-fatal",
+		"socket.timeout.ms":  10,
+		"session.timeout.ms": 10,
+		// go.consumer.close.skip.on.fatal NOT set (defaults to false)
+	})
+	if err != nil {
+		t.Fatalf("NewConsumer failed: %s", err)
+	}
+
+	// Inject a fatal error (simulates FENCED_INSTANCE_ID)
+	c.TestFatalError(ErrFencedInstanceID, "test: consumer fenced")
+
+	// Verify the fatal error is set
+	fatalErr := c.GetFatalError()
+	if fatalErr == nil {
+		t.Fatalf("Expected fatal error to be set")
+	}
+
+	// Call Close() in a goroutine — it will hang because the consumer is
+	// fatally errored and the close protocol cannot complete without a broker.
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Close()
+	}()
+
+	// Wait up to 5 seconds. Close() should NOT complete in this time,
+	// proving the hang.
+	select {
+	case err := <-done:
+		// If Close() returned, the bug is not reproduced (unexpected)
+		t.Fatalf("Expected Close() to hang, but it returned: %v", err)
+	case <-time.After(5 * time.Second):
+		// Expected: Close() is still hanging after 5 seconds.
+		// This confirms the bug that go.consumer.close.skip.on.fatal fixes.
+		t.Logf("CONFIRMED: Close() is hanging (>5s) for fatally-errored consumer without skip-on-fatal")
+	}
+
+	// The consumer goroutine is still hung in Close(). In production this
+	// leaks C-heap resources. For the test we just let the goroutine die
+	// when the process exits — there's no safe way to clean it up without
+	// the skip-on-fatal feature itself.
+}
+
 // TestConsumerCloseSkipOnFatal verifies that Close() returns immediately
 // when go.consumer.close.skip.on.fatal is enabled and a fatal error is set.
 func TestConsumerCloseSkipOnFatal(t *testing.T) {
