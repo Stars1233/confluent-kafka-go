@@ -70,6 +70,18 @@ func (c *Consumer) IsClosed() bool {
 	return atomic.LoadUint32(&c.isClosed) == 1
 }
 
+// GetFatalError returns an Error object if the client instance has raised a
+// fatal error, else nil.
+func (c *Consumer) GetFatalError() error {
+	return getFatalError(c)
+}
+
+// TestFatalError triggers a fatal error in the underlying client.
+// This is to be used strictly for testing purposes.
+func (c *Consumer) TestFatalError(code ErrorCode, str string) ErrorCode {
+	return testFatalError(c, code, str)
+}
+
 func (c *Consumer) verifyClient() error {
 	if c.IsClosed() {
 		return getOperationNotAllowedErrorForClosedClient()
@@ -568,18 +580,13 @@ func (c *Consumer) Close() (err error) {
 	// bypass the close protocol entirely. The consumer is already dead
 	// from the broker's perspective — attempting commits or LeaveGroup
 	// will either be rejected or hang if the broker is unresponsive.
-	if c.closeSkipOnFatal {
-		cErrstr := (*C.char)(C.malloc(C.size_t(512)))
-		fatalCode := C.rd_kafka_fatal_error(c.handle.rk, cErrstr, 512)
-		C.free(unsafe.Pointer(cErrstr))
-		if int(fatalCode) != 0 {
-			atomic.StoreUint32(&c.isClosed, 1)
-			C.rd_kafka_queue_destroy(c.handle.rkq)
-			c.handle.rkq = nil
-			c.handle.cleanup()
-			C.rd_kafka_destroy_flags(c.handle.rk, C.RD_KAFKA_DESTROY_F_NO_CONSUMER_CLOSE)
-			return nil
-		}
+	if c.closeSkipOnFatal && getFatalError(c) != nil {
+		atomic.StoreUint32(&c.isClosed, 1)
+		C.rd_kafka_queue_destroy(c.handle.rkq)
+		c.handle.rkq = nil
+		c.handle.cleanup()
+		C.rd_kafka_destroy_flags(c.handle.rk, C.RD_KAFKA_DESTROY_F_NO_CONSUMER_CLOSE)
+		return nil
 	}
 
 	C.rd_kafka_consumer_close_queue(c.handle.rk, c.handle.rkq)

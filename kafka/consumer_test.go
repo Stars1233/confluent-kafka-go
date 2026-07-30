@@ -768,3 +768,86 @@ func testConsumerWaitAssignment(c *Consumer, t *testing.T) {
 		}
 	}
 }
+
+// TestConsumerCloseSkipOnFatal verifies that Close() returns immediately
+// when go.consumer.close.skip.on.fatal is enabled and a fatal error is set.
+func TestConsumerCloseSkipOnFatal(t *testing.T) {
+	c, err := NewConsumer(&ConfigMap{
+		"group.id":                        "test-close-skip-on-fatal",
+		"socket.timeout.ms":               10,
+		"session.timeout.ms":              10,
+		"go.consumer.close.skip.on.fatal": true,
+	})
+	if err != nil {
+		t.Fatalf("NewConsumer failed: %s", err)
+	}
+
+	// Inject a fatal error (simulates FENCED_INSTANCE_ID)
+	c.TestFatalError(ErrFencedInstanceID, "test: consumer fenced")
+
+	// Verify the fatal error is set
+	fatalErr := c.GetFatalError()
+	if fatalErr == nil {
+		t.Fatalf("Expected fatal error to be set")
+	}
+
+	// Close should return immediately without hanging
+	start := time.Now()
+	err = c.Close()
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("Close() returned error: %s", err)
+	}
+
+	// Close should complete nearly instantly (well under 1 second)
+	if elapsed > 5*time.Second {
+		t.Fatalf("Close() took %v, expected < 5s for fatal-errored consumer", elapsed)
+	}
+	t.Logf("Close() completed in %v (skip-on-fatal)", elapsed)
+}
+
+// TestConsumerCloseSkipOnFatalDisabled verifies that the skip-on-fatal
+// config is correctly parsed and stored as false when not set.
+func TestConsumerCloseSkipOnFatalDisabled(t *testing.T) {
+	c, err := NewConsumer(&ConfigMap{
+		"group.id":           "test-close-skip-disabled",
+		"socket.timeout.ms":  10,
+		"session.timeout.ms": 10,
+		// go.consumer.close.skip.on.fatal NOT set (defaults to false)
+	})
+	if err != nil {
+		t.Fatalf("NewConsumer failed: %s", err)
+	}
+
+	// Verify the config defaults to false
+	if c.closeSkipOnFatal {
+		t.Fatalf("Expected closeSkipOnFatal to be false by default")
+	}
+
+	// Clean close without fatal error (no broker needed, completes quickly)
+	err = c.Close()
+	if err != nil {
+		t.Fatalf("Close() returned error: %s", err)
+	}
+}
+
+// TestConsumerCloseSkipOnFatalNoError verifies that Close() goes through
+// the normal path when skip-on-fatal is enabled but no fatal error is set.
+func TestConsumerCloseSkipOnFatalNoError(t *testing.T) {
+	c, err := NewConsumer(&ConfigMap{
+		"group.id":                        "test-close-skip-no-error",
+		"socket.timeout.ms":               10,
+		"session.timeout.ms":              10,
+		"go.consumer.close.skip.on.fatal": true,
+	})
+	if err != nil {
+		t.Fatalf("NewConsumer failed: %s", err)
+	}
+
+	// No fatal error set — Close should use normal path
+	err = c.Close()
+	if err != nil {
+		t.Fatalf("Close() returned error: %s", err)
+	}
+}
