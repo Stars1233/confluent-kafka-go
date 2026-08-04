@@ -769,133 +769,62 @@ func testConsumerWaitAssignment(c *Consumer, t *testing.T) {
 	}
 }
 
-// TestConsumerCloseHangsOnFatalWithoutSkip demonstrates that Close() hangs
-// when a consumer has a fatal error and go.consumer.close.skip.on.fatal is
-// NOT enabled. This reproduces the production bug: a fenced consumer's Close()
-// enters an infinite polling loop because the revocation offset commit cannot
-// complete.
-func TestConsumerCloseHangsOnFatalWithoutSkip(t *testing.T) {
+// TestConsumerCloseReturnsErrorOnFatal verifies that Close() returns
+// immediately with an error when the consumer has a fatal error set
+// (e.g., FENCED_INSTANCE_ID). This tests the fix for a bug where Close()
+// would hang indefinitely because rd_kafka_consumer_close_queue() returns
+// an error (which was previously discarded), and rd_kafka_consumer_closed()
+// would never return 1 since the close was never started.
+func TestConsumerCloseReturnsErrorOnFatal(t *testing.T) {
 	c, err := NewConsumer(&ConfigMap{
-		"group.id":           "test-close-hangs-on-fatal",
+		"group.id":           "test-close-returns-error-on-fatal",
 		"socket.timeout.ms":  10,
 		"session.timeout.ms": 10,
-		// go.consumer.close.skip.on.fatal NOT set (defaults to false)
 	})
 	if err != nil {
 		t.Fatalf("NewConsumer failed: %s", err)
 	}
 
 	// Inject a fatal error (simulates FENCED_INSTANCE_ID)
-	c.TestFatalError(ErrFencedInstanceID, "test: consumer fenced")
+	testFatalError(c, ErrFencedInstanceID, "test: consumer fenced")
 
 	// Verify the fatal error is set
-	fatalErr := c.GetFatalError()
+	fatalErr := getFatalError(c)
 	if fatalErr == nil {
 		t.Fatalf("Expected fatal error to be set")
 	}
 
-	// Call Close() in a goroutine — it will hang because the consumer is
-	// fatally errored and the close protocol cannot complete without a broker.
-	done := make(chan error, 1)
-	go func() {
-		done <- c.Close()
-	}()
-
-	// Wait up to 5 seconds. Close() should NOT complete in this time,
-	// proving the hang.
-	select {
-	case err := <-done:
-		// If Close() returned, the bug is not reproduced (unexpected)
-		t.Fatalf("Expected Close() to hang, but it returned: %v", err)
-	case <-time.After(5 * time.Second):
-		// Expected: Close() is still hanging after 5 seconds.
-		// This confirms the bug that go.consumer.close.skip.on.fatal fixes.
-		t.Logf("CONFIRMED: Close() is hanging (>5s) for fatally-errored consumer without skip-on-fatal")
-	}
-
-	// The consumer goroutine is still hung in Close(). In production this
-	// leaks C-heap resources. For the test we just let the goroutine die
-	// when the process exits — there's no safe way to clean it up without
-	// the skip-on-fatal feature itself.
-}
-
-// TestConsumerCloseSkipOnFatal verifies that Close() returns immediately
-// when go.consumer.close.skip.on.fatal is enabled and a fatal error is set.
-func TestConsumerCloseSkipOnFatal(t *testing.T) {
-	c, err := NewConsumer(&ConfigMap{
-		"group.id":                        "test-close-skip-on-fatal",
-		"socket.timeout.ms":               10,
-		"session.timeout.ms":              10,
-		"go.consumer.close.skip.on.fatal": true,
-	})
-	if err != nil {
-		t.Fatalf("NewConsumer failed: %s", err)
-	}
-
-	// Inject a fatal error (simulates FENCED_INSTANCE_ID)
-	c.TestFatalError(ErrFencedInstanceID, "test: consumer fenced")
-
-	// Verify the fatal error is set
-	fatalErr := c.GetFatalError()
-	if fatalErr == nil {
-		t.Fatalf("Expected fatal error to be set")
-	}
-
-	// Close should return immediately without hanging
+	// Close should return immediately with an error (not hang)
 	start := time.Now()
 	err = c.Close()
 	elapsed := time.Since(start)
-
-	if err != nil {
-		t.Fatalf("Close() returned error: %s", err)
-	}
 
 	// Close should complete nearly instantly (well under 1 second)
 	if elapsed > 5*time.Second {
 		t.Fatalf("Close() took %v, expected < 5s for fatal-errored consumer", elapsed)
 	}
-	t.Logf("Close() completed in %v (skip-on-fatal)", elapsed)
+
+	// Close should return an error indicating the close protocol could not start
+	if err == nil {
+		t.Fatalf("Expected Close() to return an error for fatally-errored consumer")
+	}
+
+	t.Logf("Close() completed in %v with error: %v", elapsed, err)
 }
 
-// TestConsumerCloseSkipOnFatalDisabled verifies that the skip-on-fatal
-// config is correctly parsed and stored as false when not set.
-func TestConsumerCloseSkipOnFatalDisabled(t *testing.T) {
+// TestConsumerCloseNormalPath verifies that Close() completes successfully
+// through the normal path when no fatal error is set.
+func TestConsumerCloseNormalPath(t *testing.T) {
 	c, err := NewConsumer(&ConfigMap{
-		"group.id":           "test-close-skip-disabled",
+		"group.id":           "test-close-normal-path",
 		"socket.timeout.ms":  10,
 		"session.timeout.ms": 10,
-		// go.consumer.close.skip.on.fatal NOT set (defaults to false)
 	})
 	if err != nil {
 		t.Fatalf("NewConsumer failed: %s", err)
 	}
 
-	// Verify the config defaults to false
-	if c.closeSkipOnFatal {
-		t.Fatalf("Expected closeSkipOnFatal to be false by default")
-	}
-
-	// Clean close without fatal error (no broker needed, completes quickly)
-	err = c.Close()
-	if err != nil {
-		t.Fatalf("Close() returned error: %s", err)
-	}
-}
-
-// TestConsumerCloseSkipOnFatalNoError verifies that Close() goes through
-// the normal path when skip-on-fatal is enabled but no fatal error is set.
-func TestConsumerCloseSkipOnFatalNoError(t *testing.T) {
-	c, err := NewConsumer(&ConfigMap{
-		"group.id":                        "test-close-skip-no-error",
-		"socket.timeout.ms":               10,
-		"session.timeout.ms":              10,
-		"go.consumer.close.skip.on.fatal": true,
-	})
-	if err != nil {
-		t.Fatalf("NewConsumer failed: %s", err)
-	}
-
-	// No fatal error set — Close should use normal path
+	// No fatal error set — Close should use normal path and succeed
 	err = c.Close()
 	if err != nil {
 		t.Fatalf("Close() returned error: %s", err)
