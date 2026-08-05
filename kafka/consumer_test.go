@@ -775,6 +775,9 @@ func testConsumerWaitAssignment(c *Consumer, t *testing.T) {
 // would hang indefinitely because rd_kafka_consumer_close_queue() returns
 // an error (which was previously discarded), and rd_kafka_consumer_closed()
 // would never return 1 since the close was never started.
+//
+// Close() is called in a goroutine so that a regression (infinite hang)
+// fails the test cleanly instead of blocking the entire test binary.
 func TestConsumerCloseReturnsErrorOnFatal(t *testing.T) {
 	c, err := NewConsumer(&ConfigMap{
 		"group.id":           "test-close-returns-error-on-fatal",
@@ -794,26 +797,44 @@ func TestConsumerCloseReturnsErrorOnFatal(t *testing.T) {
 		t.Fatalf("Expected fatal error to be set")
 	}
 
-	// Close should return immediately with an error (not hang)
+	// Close() must not block here. Run it in a goroutine so that a regression
+	// fails this test instead of hanging the whole test binary.
+	done := make(chan error, 1)
 	start := time.Now()
-	err = c.Close()
-	elapsed := time.Since(start)
+	go func() { done <- c.Close() }()
 
-	// Close should complete nearly instantly (well under 1 second)
-	if elapsed > 5*time.Second {
-		t.Fatalf("Close() took %v, expected < 5s for fatal-errored consumer", elapsed)
+	select {
+	case err = <-done:
+		if err == nil {
+			t.Fatalf("Expected Close() to return an error for fatally-errored consumer")
+		}
+
+		// Verify the error is specifically the fatal error we injected.
+		kafkaErr, ok := err.(Error)
+		if !ok {
+			t.Fatalf("Expected kafka.Error, got %T: %v", err, err)
+		}
+		if kafkaErr.Code() != ErrFencedInstanceID {
+			t.Fatalf("Expected error code ErrFencedInstanceID, got %v", kafkaErr.Code())
+		}
+		if !kafkaErr.IsFatal() {
+			t.Fatalf("Expected error to be fatal")
+		}
+
+		// Verify the consumer is marked as closed.
+		if !c.IsClosed() {
+			t.Fatalf("Expected consumer to be marked as closed after Close()")
+		}
+
+		t.Logf("Close() completed in %v with error: %v", time.Since(start), err)
+
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Close() did not return within 5s — the close protocol was never started (regression)")
 	}
-
-	// Close should return an error indicating the close protocol could not start
-	if err == nil {
-		t.Fatalf("Expected Close() to return an error for fatally-errored consumer")
-	}
-
-	t.Logf("Close() completed in %v with error: %v", elapsed, err)
 }
 
 // TestConsumerCloseNormalPath verifies that Close() completes successfully
-// through the normal path when no fatal error is set.
+// through the normal path when no fatal error is set (no broker required).
 func TestConsumerCloseNormalPath(t *testing.T) {
 	c, err := NewConsumer(&ConfigMap{
 		"group.id":           "test-close-normal-path",
@@ -828,5 +849,75 @@ func TestConsumerCloseNormalPath(t *testing.T) {
 	err = c.Close()
 	if err != nil {
 		t.Fatalf("Close() returned error: %s", err)
+	}
+}
+
+// TestConsumerCloseNormalPathWithBroker verifies that the normal close path
+// works correctly with a real broker — the consumer joins the group,
+// subscribes, and closes cleanly with offset commits and LeaveGroup.
+func TestConsumerCloseNormalPathWithBroker(t *testing.T) {
+	if !testconfRead() {
+		t.Skipf("Missing testconf.json")
+	}
+
+	topic := createTestTopic(t, "closeNormalPath", 1, 1)
+
+	c, err := NewConsumer(&ConfigMap{
+		"bootstrap.servers":    testconf.Brokers,
+		"group.id":             "test-close-normal-path-broker",
+		"session.timeout.ms":   6000,
+		"max.poll.interval.ms": 10000,
+		"auto.offset.reset":    "earliest",
+	})
+	if err != nil {
+		t.Fatalf("NewConsumer failed: %s", err)
+	}
+
+	// Use a rebalance callback to handle assignment.
+	assigned := make(chan bool, 1)
+	err = c.Subscribe(topic, func(c *Consumer, ev Event) error {
+		switch e := ev.(type) {
+		case AssignedPartitions:
+			c.Assign(e.Partitions)
+			select {
+			case assigned <- true:
+			default:
+			}
+		case RevokedPartitions:
+			c.Unassign()
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Subscribe failed: %s", err)
+	}
+
+	// Poll until we get an assignment (or timeout).
+	deadline := time.Now().Add(30 * time.Second)
+	gotAssignment := false
+	for time.Now().Before(deadline) && !gotAssignment {
+		c.Poll(500)
+		select {
+		case <-assigned:
+			gotAssignment = true
+		default:
+		}
+	}
+	if !gotAssignment {
+		t.Fatalf("Consumer did not receive partition assignment within timeout")
+	}
+
+	// Close should complete successfully through the full close protocol.
+	done := make(chan error, 1)
+	go func() { done <- c.Close() }()
+
+	select {
+	case err = <-done:
+		if err != nil {
+			t.Fatalf("Close() returned error: %s", err)
+		}
+		t.Logf("Close() completed successfully with broker")
+	case <-time.After(30 * time.Second):
+		t.Fatalf("Close() did not return within 30s on normal path with broker")
 	}
 }
