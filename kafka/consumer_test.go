@@ -854,7 +854,8 @@ func TestConsumerCloseNormalPath(t *testing.T) {
 
 // TestConsumerCloseNormalPathWithBroker verifies that the normal close path
 // works correctly with a real broker — the consumer joins the group,
-// subscribes, and closes cleanly with offset commits and LeaveGroup.
+// subscribes, consumes messages, and closes cleanly with offset commits
+// and LeaveGroup.
 func TestConsumerCloseNormalPathWithBroker(t *testing.T) {
 	if !testconfRead() {
 		t.Skipf("Missing testconf.json")
@@ -862,12 +863,41 @@ func TestConsumerCloseNormalPathWithBroker(t *testing.T) {
 
 	topic := createTestTopic(t, "closeNormalPath", 1, 1)
 
+	// Produce a few messages so the consumer has something to consume and commit.
+	p, err := NewProducer(&ConfigMap{
+		"bootstrap.servers": testconf.Brokers,
+	})
+	if err != nil {
+		t.Fatalf("NewProducer failed: %s", err)
+	}
+
+	drChan := make(chan Event, 3)
+	for i := 0; i < 3; i++ {
+		err = p.Produce(&Message{
+			TopicPartition: TopicPartition{Topic: &topic, Partition: 0},
+			Value:          []byte(fmt.Sprintf("test-message-%d", i)),
+		}, drChan)
+		if err != nil {
+			t.Fatalf("Produce failed: %s", err)
+		}
+		// Wait for delivery report.
+		e := <-drChan
+		m := e.(*Message)
+		if m.TopicPartition.Error != nil {
+			t.Fatalf("Delivery failed: %s", m.TopicPartition.Error)
+		}
+	}
+	p.Close()
+	t.Logf("Produced 3 messages to %s", topic)
+
+	// Create consumer and subscribe.
 	c, err := NewConsumer(&ConfigMap{
 		"bootstrap.servers":    testconf.Brokers,
 		"group.id":             "test-close-normal-path-broker",
 		"session.timeout.ms":   6000,
 		"max.poll.interval.ms": 10000,
 		"auto.offset.reset":    "earliest",
+		"enable.auto.commit":   false,
 	})
 	if err != nil {
 		t.Fatalf("NewConsumer failed: %s", err)
@@ -907,7 +937,20 @@ func TestConsumerCloseNormalPathWithBroker(t *testing.T) {
 		t.Fatalf("Consumer did not receive partition assignment within timeout")
 	}
 
-	// Close should complete successfully through the full close protocol.
+	// Consume at least one message and commit its offset so the close
+	// path exercises the offset commit protocol.
+	msg, err := c.ReadMessage(10 * time.Second)
+	if err != nil {
+		t.Fatalf("ReadMessage failed: %s", err)
+	}
+	_, err = c.CommitMessage(msg)
+	if err != nil {
+		t.Fatalf("CommitMessage failed: %s", err)
+	}
+	t.Logf("Consumed and committed message at offset %d", msg.TopicPartition.Offset)
+
+	// Close should complete successfully through the full close protocol
+	// (offset commits for stored positions, LeaveGroup, terminate).
 	done := make(chan error, 1)
 	go func() { done <- c.Close() }()
 
@@ -916,7 +959,7 @@ func TestConsumerCloseNormalPathWithBroker(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Close() returned error: %s", err)
 		}
-		t.Logf("Close() completed successfully with broker")
+		t.Logf("Close() completed successfully with broker (full commit + LeaveGroup)")
 	case <-time.After(30 * time.Second):
 		t.Fatalf("Close() did not return within 30s on normal path with broker")
 	}
