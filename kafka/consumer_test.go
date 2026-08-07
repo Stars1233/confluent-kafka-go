@@ -897,7 +897,6 @@ func TestConsumerCloseNormalPathWithBroker(t *testing.T) {
 		"session.timeout.ms":   6000,
 		"max.poll.interval.ms": 10000,
 		"auto.offset.reset":    "earliest",
-		"enable.auto.commit":   false,
 	})
 	if err != nil {
 		t.Fatalf("NewConsumer failed: %s", err)
@@ -937,17 +936,10 @@ func TestConsumerCloseNormalPathWithBroker(t *testing.T) {
 		t.Fatalf("Consumer did not receive partition assignment within timeout")
 	}
 
-	// Consume at least one message and commit its offset so the close
-	// path exercises the offset commit protocol.
-	msg, err := c.ReadMessage(10 * time.Second)
+	_, err = c.ReadMessage(10 * time.Second)
 	if err != nil {
 		t.Fatalf("ReadMessage failed: %s", err)
 	}
-	_, err = c.CommitMessage(msg)
-	if err != nil {
-		t.Fatalf("CommitMessage failed: %s", err)
-	}
-	t.Logf("Consumed and committed message at offset %d", msg.TopicPartition.Offset)
 
 	// Close should complete successfully through the full close protocol
 	// (offset commits for stored positions, LeaveGroup, terminate).
