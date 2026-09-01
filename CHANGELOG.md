@@ -6,6 +6,12 @@
 * Add support for saving Azure key version with DEK (#1577)
 * Pass context when clients make KEK calls to DEK Registry (#1579)
 
+### Fixes
+* Fix `Consumer.Close()` hanging indefinitely when the consumer has a fatal
+  error (e.g. `FENCED_INSTANCE_ID`). The error returned by
+  `rd_kafka_consumer_close_queue()` was being discarded, leaving `Close()`
+  polling for a close that was never started (#1588, @nolansherman-spoton)
+
 
 ## v2.15.0
 
