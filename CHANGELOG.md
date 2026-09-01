@@ -10,6 +10,12 @@
 ### Fixes
 * Preserve HTTP status on Schema Registry error responses (#1590)
 
+### Fixes
+* Fix `Consumer.Close()` hanging indefinitely when the consumer has a fatal
+  error (e.g. `FENCED_INSTANCE_ID`). The error returned by
+  `rd_kafka_consumer_close_queue()` was being discarded, leaving `Close()`
+  polling for a close that was never started (#1588, @nolansherman-spoton)
+
 
 ## v2.15.0
 
